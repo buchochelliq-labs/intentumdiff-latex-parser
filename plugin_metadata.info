@@ -1,0 +1,13 @@
+# Bundled parser metadata for the IntentDiff language-info API.
+
+[plugin]
+author = IntentDiff
+plugin_version = 0.1.0
+last_updated = 2026-06-11
+
+[language.latex]
+language_name = LaTeX
+language_short_name = TeX
+monaco_language = latex
+default_filename = paper.tex
+language_file_extensions = .tex,.ltx
