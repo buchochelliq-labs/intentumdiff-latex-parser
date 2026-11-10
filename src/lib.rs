@@ -22,6 +22,7 @@ struct EnvironmentFrame {
     id: String,
     name: String,
     line: u32,
+    col: u32,
     children: Vec<SemanticNode>,
 }
 
@@ -56,44 +57,108 @@ fn detect_language_impl(filename: &str, _content: &str) -> String {
     }
 }
 
+/// Commands whose argument is projected into a typed node. The flag says whether the
+/// mandatory argument is a comma-separated list (one node per item).
+fn command_kind(name: &str) -> Option<(&'static str, bool)> {
+    Some(match name {
+        "documentclass" => ("document_class", false),
+        "usepackage" | "RequirePackage" => ("package", true),
+        "part" => ("part", false),
+        "chapter" => ("chapter", false),
+        "section" => ("section", false),
+        "subsection" => ("subsection", false),
+        "subsubsection" => ("subsubsection", false),
+        "paragraph" => ("paragraph_heading", false),
+        "label" => ("label", true),
+        "ref" | "autoref" | "eqref" => ("reference", true),
+        "cite" | "citep" | "citet" => ("citation", true),
+        "input" | "include" => ("input", false),
+        "includegraphics" => ("graphic", false),
+        _ => return None,
+    })
+}
+
+/// A byte range `[start, end)` within one comment-stripped source line.
+type Span = (usize, usize);
+
+/// The shape of a recognised command: `\name*[opt]...{arg}` plus trailing groups.
+struct CommandShape {
+    /// Byte column of a `*` modifier, if present.
+    star: Option<usize>,
+    options: Vec<Span>,
+    arg: Span,
+    after: usize,
+}
+
+/// Document under construction: top-level nodes plus the open environment stack.
+struct Doc {
+    root: Vec<SemanticNode>,
+    stack: Vec<EnvironmentFrame>,
+}
+
+impl Doc {
+    fn next_id(&self) -> String {
+        match self.stack.last() {
+            Some(frame) => format!("{}.{}", frame.id, frame.children.len()),
+            None => format!("0.{}", self.root.len()),
+        }
+    }
+
+    fn push(&mut self, node: SemanticNode) {
+        match self.stack.last_mut() {
+            Some(frame) => frame.children.push(node),
+            None => self.root.push(node),
+        }
+    }
+
+    fn close_frame(&mut self, frame: EnvironmentFrame, end_line: u32, end_col: u32) {
+        let hash = stable_hash("environment", &frame.name, &frame.children);
+        let node = SemanticNodeBuilder::new(
+            &frame.id,
+            "environment",
+            &frame.name,
+            frame.line,
+            frame.col,
+            end_line,
+            end_col,
+            hash,
+        )
+        .children(frame.children)
+        .build();
+        self.push(node);
+    }
+
+    /// Close environments up to and including the innermost one named `expected`.
+    fn close_environment(&mut self, expected: &str, end_line: u32, end_col: u32) {
+        while let Some(frame) = self.stack.pop() {
+            let matched = frame.name == expected;
+            self.close_frame(frame, end_line, end_col);
+            if matched {
+                break;
+            }
+        }
+    }
+
+    fn close_all(&mut self, end_line: u32) {
+        while let Some(frame) = self.stack.pop() {
+            self.close_frame(frame, end_line, 0);
+        }
+    }
+}
+
 fn parse_latex(source: &str) -> String {
-    let mut root_children = Vec::new();
-    let mut stack: Vec<EnvironmentFrame> = Vec::new();
+    let mut doc = Doc {
+        root: Vec::new(),
+        stack: Vec::new(),
+    };
     let mut total_lines = 0u32;
 
     for (index, raw) in source.lines().enumerate() {
         let line_no = index as u32;
         total_lines = line_no;
-        let line = strip_comment(raw).trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        if let Some(env_name) = command_arg(&line, "begin") {
-            let id = next_id(stack.last(), &root_children);
-            stack.push(EnvironmentFrame {
-                id,
-                name: env_name,
-                line: line_no,
-                children: Vec::new(),
-            });
-            continue;
-        }
-
-        if let Some(env_name) = command_arg(&line, "end") {
-            close_environment(&env_name, &mut stack, &mut root_children);
-            continue;
-        }
-
-        for parsed in parse_line_nodes(&line, line_no, stack.last(), &root_children) {
-            if let Some(parent) = stack.last_mut() {
-                parent.children.push(parsed);
-            } else {
-                root_children.push(parsed);
-            }
-        }
+        scan_line(&mut doc, strip_comment(raw), line_no);
     }
-    close_all_environments(&mut stack, &mut root_children);
+    doc.close_all(total_lines);
 
     let root = SemanticNodeBuilder::new(
         "0",
@@ -103,9 +168,9 @@ fn parse_latex(source: &str) -> String {
         0,
         total_lines,
         0,
-        stable_hash(ROOT_NODE_TYPE, LANGUAGE_ID, &root_children),
+        stable_hash(ROOT_NODE_TYPE, LANGUAGE_ID, &doc.root),
     )
-    .children(root_children)
+    .children(doc.root)
     .build();
 
     match serde_json::to_string(&root) {
@@ -114,91 +179,243 @@ fn parse_latex(source: &str) -> String {
     }
 }
 
-fn parse_line_nodes(
+/// Walk one comment-stripped line in source order. Recognised commands (and
+/// `\begin`/`\end`) become typed nodes carrying their options; every other byte run
+/// on the line is kept as a `text` node so no document content is discarded.
+fn scan_line(doc: &mut Doc, line: &str, line_no: u32) {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut text_start = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let name_start = i + 1;
+        let mut j = name_start;
+        while j < bytes.len() && bytes[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        if j == name_start {
+            // Control symbol such as `\\`, `\{` or `\%`: ordinary text.
+            i += 2;
+            continue;
+        }
+        let name = &line[name_start..j];
+        let handled = match name {
+            "begin" => command_shape(line, j, false).map(|shape| {
+                emit_text(doc, line, text_start, i, line_no);
+                begin_environment(doc, line, i, line_no, &shape)
+            }),
+            "end" => command_shape(line, j, false).map(|shape| {
+                emit_text(doc, line, text_start, i, line_no);
+                let env_name = line[shape.arg.0..shape.arg.1].trim();
+                doc.close_environment(env_name, line_no, shape.after as u32);
+                shape.after
+            }),
+            _ => command_kind(name).and_then(|(node_type, split)| {
+                let shape = command_shape(line, j, true)?;
+                let values = if split {
+                    split_list(line, shape.arg)
+                } else {
+                    trimmed(line, shape.arg).into_iter().collect()
+                };
+                if values.is_empty() {
+                    return None;
+                }
+                emit_text(doc, line, text_start, i, line_no);
+                for value in values {
+                    emit_command_node(doc, line, line_no, node_type, value, &shape);
+                }
+                Some(shape.after)
+            }),
+        };
+        match handled {
+            Some(after) => {
+                i = after;
+                text_start = after;
+            }
+            None => i = j,
+        }
+    }
+    emit_text(doc, line, text_start, bytes.len(), line_no);
+}
+
+/// Parse `*`? `[opt]`* `{arg}` after a command name ending at byte `pos`.
+/// With `allow_options`, optional arguments are accepted; whitespace may precede groups.
+fn command_shape(line: &str, pos: usize, allow_options: bool) -> Option<CommandShape> {
+    let bytes = line.as_bytes();
+    let mut j = pos;
+    let star = (bytes.get(j) == Some(&b'*')).then_some(j);
+    if star.is_some() {
+        j += 1;
+    }
+    let mut options = Vec::new();
+    loop {
+        let k = skip_ws(bytes, j);
+        if allow_options && bytes.get(k) == Some(&b'[') {
+            let (inner, after) = balanced_group(bytes, k)?;
+            options.push(inner);
+            j = after;
+        } else {
+            break;
+        }
+    }
+    let k = skip_ws(bytes, j);
+    if bytes.get(k) != Some(&b'{') {
+        return None;
+    }
+    let (arg, after) = balanced_group(bytes, k)?;
+    Some(CommandShape {
+        star,
+        options,
+        arg,
+        after,
+    })
+}
+
+fn begin_environment(
+    doc: &mut Doc,
+    line: &str,
+    start: usize,
+    line_no: u32,
+    shape: &CommandShape,
+) -> usize {
+    let bytes = line.as_bytes();
+    doc.stack.push(EnvironmentFrame {
+        id: doc.next_id(),
+        name: line[shape.arg.0..shape.arg.1].trim().to_string(),
+        line: line_no,
+        col: start as u32,
+        children: Vec::new(),
+    });
+    // Environment arguments directly following `\begin{name}`, e.g. `{tabular}{ll}`.
+    let mut pos = shape.after;
+    while let Some(&open) = bytes.get(pos) {
+        if open != b'[' && open != b'{' {
+            break;
+        }
+        let Some((inner, after)) = balanced_group(bytes, pos) else {
+            break;
+        };
+        let node_type = if open == b'[' { "option" } else { "argument" };
+        let (col, label) = trimmed(line, inner).unwrap_or((inner.0, ""));
+        let id = doc.next_id();
+        doc.push(node(&id, node_type, label, line_no, col as u32, &[]));
+        pos = after;
+    }
+    pos
+}
+
+fn emit_command_node(
+    doc: &mut Doc,
     line: &str,
     line_no: u32,
-    parent: Option<&EnvironmentFrame>,
-    root_children: &[SemanticNode],
-) -> Vec<SemanticNode> {
-    let mut nodes = Vec::new();
-    if let Some(class_name) = command_arg(line, "documentclass") {
-        nodes.push(new_child(
-            "document_class",
-            &class_name,
-            line,
+    node_type: &str,
+    (col, label): (usize, &str),
+    shape: &CommandShape,
+) {
+    let id = doc.next_id();
+    let mut children = Vec::new();
+    if let Some(star_col) = shape.star {
+        let child_id = format!("{id}.{}", children.len());
+        children.push(node(
+            &child_id,
+            "modifier",
+            "*",
             line_no,
-            parent,
-            root_children,
-            &nodes,
+            star_col as u32,
+            &[],
         ));
     }
-    for package in command_args(line, "usepackage") {
-        nodes.push(new_child(
-            "package",
-            &package,
-            line,
-            line_no,
-            parent,
-            root_children,
-            &nodes,
-        ));
-    }
-    for (command, node_type) in [
-        ("part", "part"),
-        ("chapter", "chapter"),
-        ("section", "section"),
-        ("subsection", "subsection"),
-        ("subsubsection", "subsubsection"),
-        ("paragraph", "paragraph_heading"),
-    ] {
-        if let Some(title) = command_arg(line, command) {
-            nodes.push(new_child(
-                node_type,
-                &title,
-                line,
-                line_no,
-                parent,
-                root_children,
-                &nodes,
-            ));
+    for option in &shape.options {
+        for (opt_col, opt) in split_list(line, *option) {
+            let child_id = format!("{id}.{}", children.len());
+            children.push(node(&child_id, "option", opt, line_no, opt_col as u32, &[]));
         }
     }
-    for (command, node_type) in [
-        ("label", "label"),
-        ("ref", "reference"),
-        ("autoref", "reference"),
-        ("eqref", "reference"),
-        ("cite", "citation"),
-        ("citep", "citation"),
-        ("citet", "citation"),
-        ("input", "input"),
-        ("include", "input"),
-        ("includegraphics", "graphic"),
-    ] {
-        for label in command_args(line, command) {
-            nodes.push(new_child(
-                node_type,
-                &label,
-                line,
-                line_no,
-                parent,
-                root_children,
-                &nodes,
-            ));
+    doc.push(node(&id, node_type, label, line_no, col as u32, &children));
+}
+
+fn emit_text(doc: &mut Doc, line: &str, start: usize, end: usize, line_no: u32) {
+    if let Some((col, text)) = trimmed(line, (start, end)) {
+        let id = doc.next_id();
+        doc.push(node(&id, "text", text, line_no, col as u32, &[]));
+    }
+}
+
+fn skip_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while bytes.get(pos).is_some_and(|b| *b == b' ' || *b == b'\t') {
+        pos += 1;
+    }
+    pos
+}
+
+/// Balanced `{...}` or `[...]` group opening at `start`; returns the inner span and the
+/// byte offset after the closing delimiter. Backslash escapes are honoured; an optional
+/// `[...]` argument ends at the first `]` outside braces, as in LaTeX.
+fn balanced_group(bytes: &[u8], start: usize) -> Option<(Span, usize)> {
+    let open = *bytes.get(start)?;
+    let close = match open {
+        b'{' => b'}',
+        b'[' => b']',
+        _ => return None,
+    };
+    let mut braces = 0usize;
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'{' => braces += 1,
+            b'}' if braces > 0 => braces -= 1,
+            c if c == close && braces == 0 => return Some(((start + 1, i), i + 1)),
+            _ => {}
         }
+        i += 1;
     }
-    if nodes.is_empty() {
-        nodes.push(new_child(
-            "text",
-            line,
-            line,
-            line_no,
-            parent,
-            root_children,
-            &nodes,
-        ));
+    None
+}
+
+/// The trimmed sub-slice of `span` with its starting byte column, or `None` if blank.
+fn trimmed(line: &str, (start, end): Span) -> Option<(usize, &str)> {
+    let slice = &line[start..end];
+    let trimmed_start = slice.trim_start();
+    let text = trimmed_start.trim_end();
+    if text.is_empty() {
+        None
+    } else {
+        Some((start + slice.len() - trimmed_start.len(), text))
     }
-    nodes
+}
+
+/// Split a span on commas outside braces, dropping blank items.
+fn split_list(line: &str, (start, end): Span) -> Vec<(usize, &str)> {
+    let bytes = line.as_bytes();
+    let mut items = Vec::new();
+    let mut braces = 0usize;
+    let mut item_start = start;
+    let mut i = start;
+    while i < end {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'{' => braces += 1,
+            b'}' => braces = braces.saturating_sub(1),
+            b',' if braces == 0 => {
+                items.extend(trimmed(line, (item_start, i)));
+                item_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    items.extend(trimmed(line, (item_start, end)));
+    items
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -208,147 +425,8 @@ fn strip_comment(line: &str) -> &str {
             return &line[..idx];
         }
         escaped = ch == '\\' && !escaped;
-        if ch != '\\' {
-            escaped = false;
-        }
     }
     line
-}
-
-fn command_arg(line: &str, command: &str) -> Option<String> {
-    command_args(line, command).into_iter().next()
-}
-
-fn command_args(line: &str, command: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let needle = format!("\\{command}");
-    let mut rest = line;
-    while let Some(start) = rest.find(&needle) {
-        let after = &rest[start + needle.len()..];
-        if after
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_alphabetic())
-        {
-            rest = after;
-            continue;
-        }
-        let after_options = skip_options(after.trim_start());
-        let Some((arg, remaining)) = braced_argument(after_options) else {
-            break;
-        };
-        for value in arg.split(',') {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                args.push(trimmed.to_string());
-            }
-        }
-        rest = remaining;
-    }
-    args
-}
-
-fn skip_options(mut input: &str) -> &str {
-    loop {
-        let trimmed = input.trim_start();
-        let Some(after_open) = trimmed.strip_prefix('[') else {
-            return trimmed;
-        };
-        let Some(end) = after_open.find(']') else {
-            return trimmed;
-        };
-        input = &after_open[end + 1..];
-    }
-}
-
-fn braced_argument(input: &str) -> Option<(String, &str)> {
-    let after_open = input.strip_prefix('{')?;
-    let mut depth = 1usize;
-    for (idx, ch) in after_open.char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((after_open[..idx].trim().to_string(), &after_open[idx + 1..]));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn next_id(parent: Option<&EnvironmentFrame>, root_children: &[SemanticNode]) -> String {
-    match parent {
-        Some(frame) => format!("{}.{}", frame.id, frame.children.len()),
-        None => format!("0.{}", root_children.len()),
-    }
-}
-
-fn new_child(
-    node_type: &str,
-    label: &str,
-    line: &str,
-    line_no: u32,
-    parent: Option<&EnvironmentFrame>,
-    root_children: &[SemanticNode],
-    siblings: &[SemanticNode],
-) -> SemanticNode {
-    let parent_id = parent.map(|frame| frame.id.as_str()).unwrap_or("0");
-    let base = parent
-        .map(|frame| frame.children.len())
-        .unwrap_or(root_children.len());
-    let id = format!("{parent_id}.{}", base + siblings.len());
-    let col = line.find(label).unwrap_or_default() as u32;
-    node(&id, node_type, label, line_no, col, &[])
-}
-
-fn close_environment(
-    expected: &str,
-    stack: &mut Vec<EnvironmentFrame>,
-    root_children: &mut Vec<SemanticNode>,
-) {
-    while let Some(frame) = stack.pop() {
-        let node = node(
-            &frame.id,
-            "environment",
-            &frame.name,
-            frame.line,
-            0,
-            &frame.children,
-        );
-        let matched = frame.name == expected;
-        if let Some(parent) = stack.last_mut() {
-            parent.children.push(node);
-        } else {
-            root_children.push(node);
-        }
-        if matched {
-            break;
-        }
-    }
-}
-
-fn close_all_environments(
-    stack: &mut Vec<EnvironmentFrame>,
-    root_children: &mut Vec<SemanticNode>,
-) {
-    while let Some(frame) = stack.pop() {
-        let node = node(
-            &frame.id,
-            "environment",
-            &frame.name,
-            frame.line,
-            0,
-            &frame.children,
-        );
-        if let Some(parent) = stack.last_mut() {
-            parent.children.push(node);
-        } else {
-            root_children.push(node);
-        }
-    }
 }
 
 fn node(
@@ -468,7 +546,11 @@ mod tests {
     fn process_returns_valid_json() {
         let parsed = parse_latex(DEFAULT_NEW);
         intentumdiff_plugin_sdk::testing::assert_valid_json(&parsed, LANGUAGE_ID);
-        intentumdiff_plugin_sdk::testing::assert_root_node_type(&parsed, ROOT_NODE_TYPE, LANGUAGE_ID);
+        intentumdiff_plugin_sdk::testing::assert_root_node_type(
+            &parsed,
+            ROOT_NODE_TYPE,
+            LANGUAGE_ID,
+        );
     }
 
     #[test]
@@ -523,5 +605,254 @@ E = mc^2
         assert!(graphics.contains(&"figures/overview.png".to_string()));
         assert!(environments.contains(&"document".to_string()));
         assert!(environments.contains(&"equation".to_string()));
+    }
+
+    /// (node_type, label, start_line, start_col) for every node, pre-order, below the root.
+    fn flatten(source: &str) -> Vec<(String, String, u32, u32)> {
+        fn walk(node: &SemanticNode, out: &mut Vec<(String, String, u32, u32)>) {
+            for child in &node.children {
+                out.push((
+                    child.node_type.clone(),
+                    child.label.clone(),
+                    child.position.start_line,
+                    child.position.start_col,
+                ));
+                walk(child, out);
+            }
+        }
+        let root: SemanticNode = serde_json::from_str(&parse_latex(source)).unwrap();
+        let mut out = Vec::new();
+        walk(&root, &mut out);
+        out
+    }
+
+    fn root_hash(source: &str) -> String {
+        let root: SemanticNode = serde_json::from_str(&parse_latex(source)).unwrap();
+        root.structural_hash
+    }
+
+    fn entry(node_type: &str, label: &str, line: u32, col: u32) -> (String, String, u32, u32) {
+        (node_type.to_string(), label.to_string(), line, col)
+    }
+
+    // buchochelliq-labs/intentumdiff-latex-parser#4: class options were discarded.
+    #[test]
+    fn document_class_options_are_preserved() {
+        let old = "\\documentclass[10pt]{article}\n\\begin{document}Hello\\end{document}\n";
+        let new = "\\documentclass[12pt]{article}\n\\begin{document}Hello\\end{document}\n";
+        let old_nodes = flatten(old);
+        let new_nodes = flatten(new);
+        assert_eq!(old_nodes[0], entry("document_class", "article", 0, 21));
+        assert_eq!(old_nodes[1], entry("option", "10pt", 0, 15));
+        assert_eq!(new_nodes[1], entry("option", "12pt", 0, 15));
+        assert_ne!(root_hash(old), root_hash(new));
+        // Adding an option to a bare class is a change too.
+        let bare = flatten("\\documentclass{article}\n");
+        let added = flatten("\\documentclass[12pt]{article}\n");
+        assert_eq!(bare, vec![entry("document_class", "article", 0, 15)]);
+        assert_eq!(
+            added,
+            vec![
+                entry("document_class", "article", 0, 21),
+                entry("option", "12pt", 0, 15),
+            ]
+        );
+        // Multiple options are kept individually, in order.
+        let multi = flatten("\\documentclass[a4paper, twocolumn]{article}\n");
+        assert_eq!(multi[1], entry("option", "a4paper", 0, 15));
+        assert_eq!(multi[2], entry("option", "twocolumn", 0, 24));
+    }
+
+    // buchochelliq-labs/intentumdiff-latex-parser#4: package options were discarded.
+    #[test]
+    fn package_options_are_preserved() {
+        let old = "\\documentclass{article}\n\\usepackage[draft]{graphicx}\n\\begin{document}Hello\\end{document}\n";
+        let new = "\\documentclass{article}\n\\usepackage[final]{graphicx}\n\\begin{document}Hello\\end{document}\n";
+        let old_nodes = flatten(old);
+        let new_nodes = flatten(new);
+        assert_eq!(old_nodes[1], entry("package", "graphicx", 1, 19));
+        assert_eq!(old_nodes[2], entry("option", "draft", 1, 12));
+        assert_eq!(new_nodes[2], entry("option", "final", 1, 12));
+        assert_ne!(root_hash(old), root_hash(new));
+        // Options apply to every package in a list; braces protect inner commas.
+        let nodes = flatten("\\usepackage[opt={a,b}]{x, y}\n");
+        assert_eq!(
+            nodes,
+            vec![
+                entry("package", "x", 0, 23),
+                entry("option", "opt={a,b}", 0, 12),
+                entry("package", "y", 0, 26),
+                entry("option", "opt={a,b}", 0, 12),
+            ]
+        );
+        // \RequirePackage is a package load as well.
+        assert_eq!(
+            flatten("\\RequirePackage[current]{latexrelease}\n"),
+            vec![
+                entry("package", "latexrelease", 0, 25),
+                entry("option", "current", 0, 16),
+            ]
+        );
+    }
+
+    // buchochelliq-labs/intentumdiff-latex-parser#4: prose after a command was dropped.
+    #[test]
+    fn trailing_prose_after_command_is_preserved() {
+        let old = "\\section{Title} safe\n";
+        let new = "\\section{Title} danger\n";
+        assert_eq!(
+            flatten(old),
+            vec![
+                entry("section", "Title", 0, 9),
+                entry("text", "safe", 0, 16)
+            ]
+        );
+        assert_eq!(
+            flatten(new),
+            vec![
+                entry("section", "Title", 0, 9),
+                entry("text", "danger", 0, 16)
+            ]
+        );
+        assert_ne!(root_hash(old), root_hash(new));
+        // Prose between and around references keeps its order.
+        assert_eq!(
+            flatten("See \\ref{a} and \\cite{b,c}.\n"),
+            vec![
+                entry("text", "See", 0, 0),
+                entry("reference", "a", 0, 9),
+                entry("text", "and", 0, 12),
+                entry("citation", "b", 0, 22),
+                entry("citation", "c", 0, 24),
+                entry("text", ".", 0, 26),
+            ]
+        );
+    }
+
+    // buchochelliq-labs/intentumdiff-latex-parser#4: same-line environment bodies were dropped.
+    #[test]
+    fn same_line_environment_body_is_preserved() {
+        let old = "\\begin{document}safe\\end{document}\n";
+        let new = "\\begin{document}danger\\end{document}\n";
+        assert_eq!(
+            flatten(old),
+            vec![
+                entry("environment", "document", 0, 0),
+                entry("text", "safe", 0, 16)
+            ]
+        );
+        assert_eq!(
+            flatten(new),
+            vec![
+                entry("environment", "document", 0, 0),
+                entry("text", "danger", 0, 16)
+            ]
+        );
+        assert_ne!(root_hash(old), root_hash(new));
+        // Text after \end stays outside the environment.
+        assert_eq!(
+            flatten("\\begin{center}x\\end{center} y\n"),
+            vec![
+                entry("environment", "center", 0, 0),
+                entry("text", "x", 0, 14),
+                entry("text", "y", 0, 28),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_line_environment_and_arguments_are_preserved() {
+        let source = "\\begin{tabular}{ll}\na & b\n\\end{tabular}\n";
+        assert_eq!(
+            flatten(source),
+            vec![
+                entry("environment", "tabular", 0, 0),
+                entry("argument", "ll", 0, 16),
+                entry("text", "a & b", 1, 0),
+            ]
+        );
+        assert_ne!(
+            root_hash(source),
+            root_hash("\\begin{tabular}{lr}\na & b\n\\end{tabular}\n")
+        );
+        let root: SemanticNode = serde_json::from_str(&parse_latex(source)).unwrap();
+        let env = &root.children[0];
+        assert_eq!((env.position.end_line, env.position.end_col), (2, 13));
+    }
+
+    #[test]
+    fn section_star_and_short_title_are_preserved() {
+        assert_eq!(
+            flatten("\\section*{Intro}\n"),
+            vec![
+                entry("section", "Intro", 0, 10),
+                entry("modifier", "*", 0, 8)
+            ]
+        );
+        assert_eq!(
+            flatten("\\section[Short]{Long, title}\n"),
+            vec![
+                entry("section", "Long, title", 0, 16),
+                entry("option", "Short", 0, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn comments_and_layout_do_not_change_the_tree() {
+        let base = "\\section{Introduction}\nHello.\n";
+        assert_eq!(
+            root_hash(base),
+            root_hash("\\section{Introduction}% note A\nHello.\n")
+        );
+        assert_eq!(
+            root_hash("\\section{Introduction}% note A\nHello.\n"),
+            root_hash("\\section{Introduction}% note B\nHello.\n")
+        );
+        assert_eq!(
+            root_hash(base),
+            root_hash("  \\section{Introduction}  \n\n\tHello.  \n")
+        );
+        assert_eq!(
+            root_hash(base),
+            root_hash("\\section{Introduction}\n% inserted\nHello.\n")
+        );
+        assert_eq!(
+            root_hash("\\documentclass[12pt]{article}\n"),
+            root_hash("\\documentclass [ 12pt ] { article }\n")
+        );
+        // An escaped percent is text, not a comment.
+        assert_eq!(
+            flatten("50\\% off\n"),
+            vec![entry("text", "50\\% off", 0, 0)]
+        );
+        assert_ne!(root_hash("50\\% off\n"), root_hash("50\\% on\n"));
+    }
+
+    #[test]
+    fn unicode_columns_are_utf8_bytes_and_incomplete_input_is_bounded() {
+        assert_eq!(
+            flatten("\\section{Résumé} Café\n"),
+            vec![
+                entry("section", "Résumé", 0, 9),
+                entry("text", "Café", 0, 19),
+            ]
+        );
+        assert_eq!(
+            flatten("\\section{Intro"),
+            vec![entry("text", "\\section{Intro", 0, 0)]
+        );
+        assert_eq!(
+            flatten("\\usepackage[draft"),
+            vec![entry("text", "\\usepackage[draft", 0, 0)]
+        );
+        assert_eq!(
+            flatten("\\begin{x}\\é\\"),
+            vec![
+                entry("environment", "x", 0, 0),
+                entry("text", "\\é\\", 0, 9)
+            ]
+        );
+        assert_eq!(parse_latex("\\section{A}\n"), parse_latex("\\section{A}\n"));
     }
 }
