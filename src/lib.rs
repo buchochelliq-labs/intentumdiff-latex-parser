@@ -94,6 +94,10 @@ struct CommandShape {
 struct Doc {
     root: Vec<SemanticNode>,
     stack: Vec<EnvironmentFrame>,
+    /// The previous line ended right after `\begin{env}` (or one of its
+    /// arguments), so `[...]`/`{...}` groups opening this line are still its
+    /// arguments: LaTeX reads the line break as a space (#6).
+    env_args_pending: bool,
 }
 
 impl Doc {
@@ -150,13 +154,21 @@ fn parse_latex(source: &str) -> String {
     let mut doc = Doc {
         root: Vec::new(),
         stack: Vec::new(),
+        env_args_pending: false,
     };
     let mut total_lines = 0u32;
 
     for (index, raw) in source.lines().enumerate() {
         let line_no = index as u32;
         total_lines = line_no;
-        scan_line(&mut doc, strip_comment(raw), line_no);
+        let line = strip_comment(raw);
+        if doc.env_args_pending && line.trim().is_empty() {
+            // A comment-only line swallows its own line break; a blank line
+            // is a paragraph break and ends the argument list.
+            doc.env_args_pending = line.len() < raw.len();
+            continue;
+        }
+        scan_line(&mut doc, line, line_no);
     }
     doc.close_all(total_lines);
 
@@ -186,6 +198,10 @@ fn scan_line(doc: &mut Doc, line: &str, line_no: u32) {
     let bytes = line.as_bytes();
     let mut i = 0usize;
     let mut text_start = 0usize;
+    if std::mem::take(&mut doc.env_args_pending) {
+        i = environment_arguments(doc, line, 0, line_no);
+        text_start = i;
+    }
     while i < bytes.len() {
         if bytes[i] != b'\\' {
             i += 1;
@@ -281,7 +297,6 @@ fn begin_environment(
     line_no: u32,
     shape: &CommandShape,
 ) -> usize {
-    let bytes = line.as_bytes();
     doc.stack.push(EnvironmentFrame {
         id: doc.next_id(),
         name: line[shape.arg.0..shape.arg.1].trim().to_string(),
@@ -289,13 +304,25 @@ fn begin_environment(
         col: start as u32,
         children: Vec::new(),
     });
-    // Environment arguments directly following `\begin{name}`, e.g. `{tabular}{ll}`.
-    let mut pos = shape.after;
-    while let Some(&open) = bytes.get(pos) {
+    environment_arguments(doc, line, shape.after, line_no)
+}
+
+/// Environment arguments following `\begin{name}` from byte `pos`, e.g.
+/// `{tabular}{ll}`. Spaces and tabs may separate them, and a line ending
+/// after `\begin{name}` or an argument leaves the list open for the next line.
+/// Returns the byte offset after the last argument.
+fn environment_arguments(doc: &mut Doc, line: &str, mut pos: usize, line_no: u32) -> usize {
+    let bytes = line.as_bytes();
+    loop {
+        let k = skip_ws(bytes, pos);
+        let Some(&open) = bytes.get(k) else {
+            doc.env_args_pending = true;
+            break;
+        };
         if open != b'[' && open != b'{' {
             break;
         }
-        let Some((inner, after)) = balanced_group(bytes, pos) else {
+        let Some((inner, after)) = balanced_group(bytes, k) else {
             break;
         };
         let node_type = if open == b'[' { "option" } else { "argument" };
@@ -854,5 +881,46 @@ E = mc^2
             ]
         );
         assert_eq!(parse_latex("\\section{A}\n"), parse_latex("\\section{A}\n"));
+    }
+
+    // buchochelliq-labs/intentumdiff-latex-parser#6: whitespace (and one line
+    // break) between `\begin{env}` and its arguments is layout.
+    #[test]
+    fn environment_arguments_after_whitespace_are_arguments() {
+        let base = "\\begin{tabular}{ll}\na & b\n\\end{tabular}\n";
+        let types = |src: &str| -> Vec<(String, String)> {
+            flatten(src).into_iter().map(|(t, l, _, _)| (t, l)).collect()
+        };
+        for variant in [
+            "\\begin{tabular} {ll}\na & b\n\\end{tabular}\n",
+            "\\begin{tabular}\t {ll}\na & b\n\\end{tabular}\n",
+            "\\begin{tabular}\n{ll}\na & b\n\\end{tabular}\n",
+            "\\begin{tabular}  \n   {ll}\na & b\n\\end{tabular}\n",
+            "\\begin{tabular}% note\n% more\n  {ll}\na & b\n\\end{tabular}\n",
+        ] {
+            assert_eq!(types(variant), types(base), "{variant:?}");
+            assert_eq!(root_hash(variant), root_hash(base), "{variant:?}");
+        }
+        assert_eq!(
+            flatten("\\begin{tabular}\n  {ll}\n\\end{tabular}\n")[1],
+            entry("argument", "ll", 1, 3)
+        );
+        assert_eq!(
+            flatten("\\begin{tabular} [t] {ll}\n\\end{tabular}\n"),
+            vec![
+                entry("environment", "tabular", 0, 0),
+                entry("option", "t", 0, 17),
+                entry("argument", "ll", 0, 21),
+            ]
+        );
+        assert_ne!(
+            root_hash("\\begin{tabular}\n{ll}\n\\end{tabular}\n"),
+            root_hash("\\begin{tabular}\n{lr}\n\\end{tabular}\n")
+        );
+        // A blank line ends the argument list: the group is body text.
+        assert_eq!(
+            types("\\begin{tabular}\n\n{ll}\n\\end{tabular}\n")[1],
+            ("text".to_string(), "{ll}".to_string())
+        );
     }
 }
